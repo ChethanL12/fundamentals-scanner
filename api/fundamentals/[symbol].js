@@ -133,54 +133,63 @@ function saField(page, field) {
 async function fetchFinvizEpsGrowth(symbol) {
   if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
   try {
+    // Step 1: visit homepage to get cookies (helps bypass Cloudflare)
+    const baseHeaders = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, br",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Cache-Control": "max-age=0",
+    };
+    const homeRes = await httpsGet({
+      hostname: "finviz.com",
+      path: "/",
+      headers: baseHeaders,
+    });
+    const cookie = homeRes.rawCookies.map(c => c.split(";")[0]).join("; ");
+    await delay(800);
+
+    // Step 2: fetch the stock page with the cookie
     const res = await httpsGet({
       hostname: "finviz.com",
-      path: `/quote.ashx?t=${encodeURIComponent(symbol.toUpperCase())}`,
+      path: `/quote.ashx?t=${encodeURIComponent(symbol.toUpperCase())}&p=d`,
       headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Encoding": "gzip, br",
-        "Accept-Language": "en-US,en;q=0.9",
+        ...baseHeaders,
         Referer: "https://finviz.com/",
-        "Cache-Control": "no-cache",
+        "Sec-Fetch-Site": "same-origin",
+        ...(cookie ? { Cookie: cookie } : {}),
       },
     });
     if (res.status !== 200) return null;
     const html = res.body;
-    // Must contain stock data — if Finviz served a bot-block page, bail early
+    // Bail if Cloudflare served a challenge page (no stock data)
     if (!html.includes("EPS next 5Y") && !html.includes("EPS next Y")) return null;
 
-    // Primary: tight regex matching label → value in next cell
+    // Tight regex: label</td> <td><b>[<span>]VALUE%
     function finvizPct(label) {
       const esc = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      // Handles: label</td><td ...><b>[<span ...>]VALUE%[</span>]</b>
       const re = new RegExp(esc + "<\/td>\\s*<td[^>]*>\\s*<b>\\s*(?:<span[^>]*>\\s*)?([-\\d.]+)%");
       const m = html.match(re);
-      if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
-      return null;
+      return m ? (isFinite(+m[1]) ? +m[1] : null) : null;
     }
-    function finvizDollar(label) {
-      const esc = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(esc + "<\/td>\\s*<td[^>]*>\\s*<b>\\s*(?:<span[^>]*>\\s*)?([-\\d.]+)(?!%)");
-      const m = html.match(re);
-      if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
-      return null;
-    }
-    // Fallback: looser search — find label then grab first % within 200 chars
+    // Loose fallback: find label, grab nearest % value within 200 chars
     function finvizLoose(label) {
       const idx = html.indexOf(label);
       if (idx === -1) return null;
-      const slice = html.slice(idx, idx + 200);
-      const m = slice.match(/([-\d.]+)%/);
-      if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
-      return null;
+      const m = html.slice(idx, idx + 200).match(/([-\d.]+)%/);
+      return m ? (isFinite(+m[1]) ? +m[1] : null) : null;
     }
 
-    // Priority 1: Finviz "EPS next 5Y" %
+    // Priority 1: Finviz “EPS next 5Y”
     const next5Y = finvizPct("EPS next 5Y") ?? finvizLoose("EPS next 5Y");
     if (next5Y !== null) return next5Y;
 
-    // Priority 2: Finviz "EPS next Y" %  
+    // Priority 2: Finviz “EPS next Y” %
     const nextY = finvizPct("EPS next Y") ?? finvizLoose("EPS next Y");
     if (nextY !== null) return nextY;
 
@@ -188,17 +197,20 @@ async function fetchFinvizEpsGrowth(symbol) {
   } catch { return null; }
 }
 
-// ── Yahoo Finance: EPS Growth from earningsTrend (fallback for US stocks) ────
+// ── Yahoo Finance: EPS Growth from earningsTrend (fallback for all stocks) ──
 async function fetchYahooEpsGrowth(symbol) {
   try {
     const result = await yahooQuoteSummary(symbol, ["earningsTrend"]);
     const et = result.earningsTrend;
     if (!et?.trend?.length) return null;
-    // Prefer next year (+1y) growth estimate; fall back to current year (0y)
-    const entry = et.trend.find(t => t.period === "+1y") ?? et.trend.find(t => t.period === "0y");
-    if (entry?.growth !== undefined) {
-      const g = raw(entry.growth);
-      if (g !== null) return g * 100;
+    // Priority: 5Y estimate → Next Year → Current Year
+    const priority = ["5y", "+1y", "0y"];
+    for (const period of priority) {
+      const entry = et.trend.find(t => t.period === period);
+      if (entry?.growth !== undefined) {
+        const g = raw(entry.growth);
+        if (g !== null && isFinite(g)) return +(g * 100).toFixed(2);
+      }
     }
     return null;
   } catch { return null; }

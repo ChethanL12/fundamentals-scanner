@@ -129,6 +129,36 @@ function saField(page, field) {
   return page.data[idx];
 }
 
+// ── Finviz EPS Growth Cache (GitHub-hosted, updated by Actions cron) ──────────
+// Module-level in-memory cache so warm Vercel instances skip the fetch
+let _fvCache = null;
+let _fvCacheAt = 0;
+const FV_CACHE_URL = "https://raw.githubusercontent.com/ChethanL12/fundamentals-scanner/main/finviz_cache.json";
+const FV_CACHE_TTL = 60 * 60 * 1000; // 1 hour in-memory TTL
+
+async function fetchFinvizCacheGrowth(symbol) {
+  // Only for plain US tickers (no .NS/.BO/.DU/.AE suffix)
+  if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
+  try {
+    // Refresh in-memory cache if stale or missing
+    if (!_fvCache || Date.now() - _fvCacheAt > FV_CACHE_TTL) {
+      const res = await httpsGet({
+        hostname: "raw.githubusercontent.com",
+        path: "/ChethanL12/fundamentals-scanner/main/finviz_cache.json",
+        headers: { "User-Agent": UA, Accept: "application/json" },
+      });
+      if (res.status === 200) {
+        const json = JSON.parse(res.body);
+        _fvCache = json.data ?? {};
+        _fvCacheAt = Date.now();
+      }
+    }
+    if (!_fvCache) return null;
+    const v = _fvCache[symbol.toUpperCase()];
+    return typeof v === "number" && isFinite(v) ? v : null;
+  } catch { return null; }
+}
+
 // ── Yahoo Finance result helpers ──────────────────────────────────────────────
 function raw(v) {
   if (v === null || v === undefined) return null;
@@ -211,11 +241,12 @@ async function fetchViaStockAnalysis(symbol) {
   if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
   const slug = symbol.toLowerCase();
 
-  const [overview, income, cashflow, balance] = await Promise.all([
+  const [overview, income, cashflow, balance, finvizGrowth] = await Promise.all([
     fetchSaPage(slug),
     fetchSaPage(`${slug}/financials`),
     fetchSaPage(`${slug}/financials/cash-flow-statement`),
     fetchSaPage(`${slug}/financials/balance-sheet`),
+    fetchFinvizCacheGrowth(symbol),  // runs in parallel — no extra latency
   ]);
   if (!overview) return null;
 
@@ -223,20 +254,21 @@ async function fetchViaStockAnalysis(symbol) {
   const peStrRaw = saField(overview, "peRatio");
   const pe = typeof peStrRaw === "string" ? (parseFloat(peStrRaw) || null) : (typeof peStrRaw === "number" ? peStrRaw : null);
 
-  // ── EPS Growth: trailingPE / forwardPE - 1 (derived entirely from SA data) ─
-  // Proof: trailingPE = price/epsTrailing, forwardPE = price/epsForward
-  //        trailingPE / forwardPE = epsForward / epsTrailing = (1 + growth)
-  //        growth = trailingPE / forwardPE - 1
-  // SA confirmed to return forwardPE field. Fallback: SA's epsGrowth (trailing YoY).
-  let epsGrowthRate = null;
-  const forwardPe = saNum(overview, "forwardPE");
-  if (pe !== null && forwardPe !== null && forwardPe > 0) {
-    const g = (pe / forwardPe - 1) * 100;
-    if (isFinite(g)) epsGrowthRate = +g.toFixed(2);
+  // ── EPS Growth priority: ─────────────────────────────────────────────────
+  // 1. Finviz cache (GitHub Actions: "EPS next 5Y" → "EPS next Y")
+  // 2. SA forwardPE/trailingPE ratio (derived, no auth)
+  // 3. SA pre-computed epsGrowth field (trailing YoY fallback)
+  let epsGrowthRate = finvizGrowth;  // may be null if ticker not yet cached
+  if (epsGrowthRate === null) {
+    const forwardPe = saNum(overview, "forwardPE");
+    if (pe !== null && forwardPe !== null && forwardPe > 0) {
+      const g = (pe / forwardPe - 1) * 100;
+      if (isFinite(g)) epsGrowthRate = +g.toFixed(2);
+    }
   }
   if (epsGrowthRate === null) {
-    const saGrowth = saNum(overview, "epsGrowth");
-    if (saGrowth !== null && isFinite(saGrowth)) epsGrowthRate = +saGrowth.toFixed(2);
+    const saG = saNum(overview, "epsGrowth");
+    if (saG !== null && isFinite(saG)) epsGrowthRate = +saG.toFixed(2);
   }
 
   let price = null;

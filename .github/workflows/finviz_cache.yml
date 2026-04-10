@@ -1,0 +1,36 @@
+name: Update Finviz EPS Cache
+
+on:
+  schedule:
+    # Run 4x per day: 1am, 7am, 1pm, 7pm UTC
+    - cron: '0 1,7,13,19 * * *'
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Finviz scraper
+        run: python scripts/scrape_finviz.py
+
+      - name: Commit and push cache update
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add finviz_cache.json
+          git diff --staged --quiet || git commit -m "chore: update Finviz EPS cache [skip ci]"
+          git push

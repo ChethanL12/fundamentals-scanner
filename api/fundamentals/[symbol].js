@@ -129,68 +129,38 @@ function saField(page, field) {
   return page.data[idx];
 }
 
-// ── EPS Growth: scrape Yahoo Finance Analysis page HTML (no crumb needed) ─────
-// Yahoo Finance uses Next.js SSR — the Growth Estimates data is embedded in
-// the initial __NEXT_DATA__ JSON. We parse it directly from the page HTML.
+// ── EPS Growth via Yahoo Finance v7/finance/quote (no auth required) ──────────
+// Uses epsForward (next 12m estimate) vs epsTrailingTwelveMonths (TTM).
+// Growth = (epsForward - epsTrailingTwelveMonths) / |epsTrailingTwelveMonths|
+// This endpoint is public and requires no crumb or cookie.
 async function fetchYahooEpsGrowth(symbol) {
   try {
+    const fields = "epsForward,epsTrailingTwelveMonths";
     const res = await httpsGet({
-      hostname: "finance.yahoo.com",
-      path: `/quote/${encodeURIComponent(symbol)}/analysis/`,
+      hostname: "query1.finance.yahoo.com",
+      path: `/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&fields=${fields}&lang=en-US&region=US&corsDomain=finance.yahoo.com`,
       headers: {
         "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,*/*;q=0.9",
+        Accept: "application/json",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, br",
-        "Cache-Control": "no-cache",
+        Referer: "https://finance.yahoo.com/",
       },
     });
     if (res.status !== 200) return null;
-    const html = res.body;
+    const json = JSON.parse(res.body);
+    const quote = json?.quoteResponse?.result?.[0];
+    if (!quote) return null;
 
-    // Strategy 1: parse __NEXT_DATA__ JSON (most reliable)
-    const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (nextDataMatch) {
-      try {
-        const nd = JSON.parse(nextDataMatch[1]);
-        // Walk the data tree looking for earningsTrend
-        const trend = findEarningsTrend(nd);
-        if (trend) {
-          const entry = trend.find(t => t.period === "+1y") ?? trend.find(t => t.period === "0y");
-          const g = entry?.growth?.raw ?? entry?.growth;
-          if (typeof g === "number" && isFinite(g)) return +(g * 100).toFixed(2);
-        }
-      } catch { /* fall through to regex */ }
-    }
+    const epsForward = quote.epsForward;
+    const epsTrailing = quote.epsTrailingTwelveMonths;
 
-    // Strategy 2: regex scan for "+1y" growth value anywhere in the page
-    // Matches patterns like: "period":"+1y"...,"growth":{"raw":0.0944
-    // or: "period":"+1y"...,"growth":0.0944
-    const re1 = /"\+1y"[\s\S]{0,300}?"growth":\{"raw":([-\d.]+)/;
-    const re2 = /"\+1y"[\s\S]{0,300}?"growth":([-\d.]+)/;
-    for (const re of [re1, re2]) {
-      const m = html.match(re);
-      if (m) {
-        const v = parseFloat(m[1]);
-        if (isFinite(v) && Math.abs(v) < 50) return +(v * 100).toFixed(2); // sanity check: raw value is 0.09, not 9
-      }
-    }
-
-    return null;
+    // Need both values and a non-zero denominator
+    if (typeof epsForward !== "number" || typeof epsTrailing !== "number" || epsTrailing === 0) return null;
+    const growth = ((epsForward - epsTrailing) / Math.abs(epsTrailing)) * 100;
+    if (!isFinite(growth)) return null;
+    return +growth.toFixed(2);
   } catch { return null; }
 }
-
-// Recursively find earningsTrend.trend array in nested JSON
-function findEarningsTrend(obj, depth = 0) {
-  if (!obj || typeof obj !== "object" || depth > 12) return null;
-  if (obj.earningsTrend?.trend?.length) return obj.earningsTrend.trend;
-  for (const val of Object.values(obj)) {
-    const found = findEarningsTrend(val, depth + 1);
-    if (found) return found;
-  }
-  return null;
-}
-
 
 
 // ── Yahoo Finance result helpers ──────────────────────────────────────────────

@@ -1,5 +1,5 @@
 // Vercel Serverless Function: /api/fundamentals/[symbol]
-// US stocks: stockanalysis.com (financial metrics) + Yahoo Finance earningsTrend (EPS growth)
+// US stocks: stockanalysis.com (all metrics including EPS growth via forwardPE)
 // India/UAE: Yahoo Finance quoteSummary (crumb auth)
 
 import https from "node:https";
@@ -33,7 +33,7 @@ function httpsGet(options) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Yahoo Finance Crumb Auth ──────────────────────────────────────────────────
+// ── Yahoo Finance Crumb Auth (for international stocks only) ──────────────────
 async function fetchYahooCrumb() {
   const cookieRes = await httpsGet({
     hostname: "finance.yahoo.com",
@@ -129,40 +129,6 @@ function saField(page, field) {
   return page.data[idx];
 }
 
-// ── EPS Growth via Yahoo Finance v7/finance/quote (no auth required) ──────────
-// Uses epsForward (next 12m estimate) vs epsTrailingTwelveMonths (TTM).
-// Growth = (epsForward - epsTrailingTwelveMonths) / |epsTrailingTwelveMonths|
-// This endpoint is public and requires no crumb or cookie.
-async function fetchYahooEpsGrowth(symbol) {
-  try {
-    const fields = "epsForward,epsTrailingTwelveMonths";
-    const res = await httpsGet({
-      hostname: "query1.finance.yahoo.com",
-      path: `/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&fields=${fields}&lang=en-US&region=US&corsDomain=finance.yahoo.com`,
-      headers: {
-        "User-Agent": UA,
-        Accept: "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        Referer: "https://finance.yahoo.com/",
-      },
-    });
-    if (res.status !== 200) return null;
-    const json = JSON.parse(res.body);
-    const quote = json?.quoteResponse?.result?.[0];
-    if (!quote) return null;
-
-    const epsForward = quote.epsForward;
-    const epsTrailing = quote.epsTrailingTwelveMonths;
-
-    // Need both values and a non-zero denominator
-    if (typeof epsForward !== "number" || typeof epsTrailing !== "number" || epsTrailing === 0) return null;
-    const growth = ((epsForward - epsTrailing) / Math.abs(epsTrailing)) * 100;
-    if (!isFinite(growth)) return null;
-    return +growth.toFixed(2);
-  } catch { return null; }
-}
-
-
 // ── Yahoo Finance result helpers ──────────────────────────────────────────────
 function raw(v) {
   if (v === null || v === undefined) return null;
@@ -175,6 +141,7 @@ function str(v) {
   return v.raw ?? null;
 }
 
+// ── Build result from Yahoo quoteSummary (India/UAE) ─────────────────────────
 function buildResultFromYahoo(symbol, result) {
   const ks = result.defaultKeyStatistics ?? {};
   const fd = result.financialData ?? {};
@@ -206,12 +173,15 @@ function buildResultFromYahoo(symbol, result) {
     } else if (ebitda !== null) ebit = ebitda * 0.88;
   }
 
-  // EPS growth: "+1y" from earningsTrend (matches Yahoo Finance Analysis page)
+  // EPS growth from earningsTrend "+1y" period
   let epsGrowthRate = null;
   const et = result.earningsTrend;
   if (et?.trend?.length) {
     const entry = et.trend.find(t => t.period === "+1y") ?? et.trend.find(t => t.period === "0y");
-    if (entry?.growth !== undefined) { const g = raw(entry.growth); if (g !== null) epsGrowthRate = +(g * 100).toFixed(2); }
+    if (entry?.growth !== undefined) {
+      const g = raw(entry.growth);
+      if (g !== null && isFinite(g)) epsGrowthRate = +(g * 100).toFixed(2);
+    }
   }
 
   let netDebtEquity = null;
@@ -240,7 +210,7 @@ function buildResultFromYahoo(symbol, result) {
 async function fetchViaStockAnalysis(symbol) {
   if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
   const slug = symbol.toLowerCase();
-  // Fetch all financial pages in parallel
+
   const [overview, income, cashflow, balance] = await Promise.all([
     fetchSaPage(slug),
     fetchSaPage(`${slug}/financials`),
@@ -252,6 +222,22 @@ async function fetchViaStockAnalysis(symbol) {
   const eps = saNum(overview, "eps");
   const peStrRaw = saField(overview, "peRatio");
   const pe = typeof peStrRaw === "string" ? (parseFloat(peStrRaw) || null) : (typeof peStrRaw === "number" ? peStrRaw : null);
+
+  // ── EPS Growth: trailingPE / forwardPE - 1 (derived entirely from SA data) ─
+  // Proof: trailingPE = price/epsTrailing, forwardPE = price/epsForward
+  //        trailingPE / forwardPE = epsForward / epsTrailing = (1 + growth)
+  //        growth = trailingPE / forwardPE - 1
+  // SA confirmed to return forwardPE field. Fallback: SA's epsGrowth (trailing YoY).
+  let epsGrowthRate = null;
+  const forwardPe = saNum(overview, "forwardPE");
+  if (pe !== null && forwardPe !== null && forwardPe > 0) {
+    const g = (pe / forwardPe - 1) * 100;
+    if (isFinite(g)) epsGrowthRate = +g.toFixed(2);
+  }
+  if (epsGrowthRate === null) {
+    const saGrowth = saNum(overview, "epsGrowth");
+    if (saGrowth !== null && isFinite(saGrowth)) epsGrowthRate = +saGrowth.toFixed(2);
+  }
 
   let price = null;
   const targetStr = saField(overview, "target");
@@ -283,6 +269,8 @@ async function fetchViaStockAnalysis(symbol) {
     ? (totalDebt - totalCash) / equity : null;
   const operatingProfitToCash = (ebit !== null && operatingCashFlow && operatingCashFlow !== 0)
     ? ebit / operatingCashFlow : null;
+  const peg = (pe !== null && epsGrowthRate !== null && epsGrowthRate > 0)
+    ? +(pe / epsGrowthRate).toFixed(2) : null;
 
   let companyName = symbol;
   const desc = saField(overview, "description");
@@ -292,8 +280,7 @@ async function fetchViaStockAnalysis(symbol) {
     else { const clause = desc.split(/[,.]/)[0]; if (clause && clause.length < 80) companyName = clause.trim(); }
   }
 
-  // EPS growth and PEG set to null here — filled in by orchestrator via Yahoo
-  return { symbol, companyName, currency: "USD", price, eps, pe, epsGrowthRate: null, peg: null, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
+  return { symbol, companyName, currency: "USD", price, eps, pe, epsGrowthRate, peg, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
 }
 
 // ── fetchViaCrumb (India/UAE) ─────────────────────────────────────────────────
@@ -326,25 +313,13 @@ async function fetchFundamentals(symbol) {
   const isInternational = /\.(NS|BO|DU|AE)$/i.test(symbol);
 
   if (!isInternational) {
-    // US stocks: SA for financials + Yahoo earningsTrend for EPS growth (run in parallel)
-    const [saResult, yahooGrowth] = await Promise.all([
-      fetchViaStockAnalysis(symbol),
-      fetchYahooEpsGrowth(symbol),
-    ]);
-
-    if (saResult) {
-      // Fill in EPS growth and recalculate PEG
-      saResult.epsGrowthRate = yahooGrowth;
-      if (saResult.pe !== null && yahooGrowth !== null && yahooGrowth > 0) {
-        saResult.peg = +(saResult.pe / yahooGrowth).toFixed(2);
-      }
-      return saResult;
-    }
-    // Full Yahoo fallback if SA fails
+    const saResult = await fetchViaStockAnalysis(symbol);
+    if (saResult) return saResult;
+    // Full Yahoo fallback if SA returns nothing
     try { return await fetchViaCrumb(symbol); } catch { return null; }
   }
 
-  // International: Yahoo quoteSummary + live price
+  // International: Yahoo quoteSummary + live price (in parallel)
   const [crumbResult, livePrice] = await Promise.allSettled([
     fetchViaCrumb(symbol),
     fetchLivePrice(symbol),

@@ -136,32 +136,69 @@ async function fetchFinvizEpsGrowth(symbol) {
     const res = await httpsGet({
       hostname: "finviz.com",
       path: `/quote.ashx?t=${encodeURIComponent(symbol.toUpperCase())}`,
-      headers: { "User-Agent": UA, Accept: "text/html,*/*", "Accept-Encoding": "gzip, br", "Referer": "https://finviz.com/" },
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Encoding": "gzip, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        Referer: "https://finviz.com/",
+        "Cache-Control": "no-cache",
+      },
     });
     if (res.status !== 200) return null;
     const html = res.body;
+    // Must contain stock data — if Finviz served a bot-block page, bail early
+    if (!html.includes("EPS next 5Y") && !html.includes("EPS next Y")) return null;
+
+    // Primary: tight regex matching label → value in next cell
     function finvizPct(label) {
       const esc = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(esc + "<\\/td><td[^>]*><b>(?:<span[^>]*>)?([-\\d.]+)%(?:<\\/span>)?<\\/b>");
+      // Handles: label</td><td ...><b>[<span ...>]VALUE%[</span>]</b>
+      const re = new RegExp(esc + "<\/td>\\s*<td[^>]*>\\s*<b>\\s*(?:<span[^>]*>\\s*)?([-\\d.]+)%");
       const m = html.match(re);
       if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
       return null;
     }
     function finvizDollar(label) {
       const esc = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(esc + "<\\/td><td[^>]*><b>(?:<span[^>]*>)?([-\\d.]+)(?:<\\/span>)?<\\/b>");
+      const re = new RegExp(esc + "<\/td>\\s*<td[^>]*>\\s*<b>\\s*(?:<span[^>]*>\\s*)?([-\\d.]+)(?!%)");
       const m = html.match(re);
       if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
       return null;
     }
-    const next5Y = finvizPct("EPS next 5Y");
+    // Fallback: looser search — find label then grab first % within 200 chars
+    function finvizLoose(label) {
+      const idx = html.indexOf(label);
+      if (idx === -1) return null;
+      const slice = html.slice(idx, idx + 200);
+      const m = slice.match(/([-\d.]+)%/);
+      if (m) { const v = parseFloat(m[1]); return isFinite(v) ? v : null; }
+      return null;
+    }
+
+    // Priority 1: Finviz "EPS next 5Y" %
+    const next5Y = finvizPct("EPS next 5Y") ?? finvizLoose("EPS next 5Y");
     if (next5Y !== null) return next5Y;
-    const nextY = finvizPct("EPS next Y");
+
+    // Priority 2: Finviz "EPS next Y" %  
+    const nextY = finvizPct("EPS next Y") ?? finvizLoose("EPS next Y");
     if (nextY !== null) return nextY;
-    const epsNextY = finvizDollar("EPS next Y");
-    const epsTtm = finvizDollar("EPS (ttm)");
-    if (epsNextY !== null && epsTtm !== null && epsTtm !== 0) {
-      return ((epsNextY - epsTtm) / Math.abs(epsTtm)) * 100;
+
+    return null;
+  } catch { return null; }
+}
+
+// ── Yahoo Finance: EPS Growth from earningsTrend (fallback for US stocks) ────
+async function fetchYahooEpsGrowth(symbol) {
+  try {
+    const result = await yahooQuoteSummary(symbol, ["earningsTrend"]);
+    const et = result.earningsTrend;
+    if (!et?.trend?.length) return null;
+    // Prefer next year (+1y) growth estimate; fall back to current year (0y)
+    const entry = et.trend.find(t => t.period === "+1y") ?? et.trend.find(t => t.period === "0y");
+    if (entry?.growth !== undefined) {
+      const g = raw(entry.growth);
+      if (g !== null) return g * 100;
     }
     return null;
   } catch { return null; }
@@ -333,8 +370,22 @@ async function fetchFundamentals(symbol) {
   const isInternational = /\.(NS|BO|DU|AE)$/i.test(symbol);
   if (!isInternational) {
     const saResult = await fetchViaStockAnalysis(symbol);
-    if (saResult) return saResult;
-    // Fallback: use crumb for US stocks too
+    if (saResult) {
+      // EPS Growth fallback chain: Finviz 5Y → Finviz Next Y → Yahoo earningsTrend
+      if (saResult.epsGrowthRate === null) {
+        console.log(`[${symbol}] Finviz blocked or returned null — trying Yahoo earningsTrend`);
+        const yahooGrowth = await fetchYahooEpsGrowth(symbol);
+        if (yahooGrowth !== null) {
+          saResult.epsGrowthRate = yahooGrowth;
+          // Recalculate PEG with the newly found growth rate
+          if (saResult.pe !== null && yahooGrowth > 0) {
+            saResult.peg = +(saResult.pe / yahooGrowth).toFixed(2);
+          }
+        }
+      }
+      return saResult;
+    }
+    // Full Yahoo fallback for unknown US tickers
     try { return await fetchViaCrumb(symbol); } catch { return null; }
   }
   // International: Yahoo quoteSummary + live price

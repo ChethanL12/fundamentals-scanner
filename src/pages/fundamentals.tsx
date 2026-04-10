@@ -79,7 +79,7 @@ const METRICS: {
   {
     key: "epsGrowthRate",
     label: "EPS Growth (5Y)",
-    description: "Next 5Y EPS growth estimate (Finviz); next year estimate if unavailable",
+    description: "Next year EPS growth estimate (Yahoo Finance Analysis → Growth Estimates)",
     format: (v) => formatNumber(v, { decimals: 2, suffix: "%" }),
     colorFn: (v) => getColorClass(v, true),
   },

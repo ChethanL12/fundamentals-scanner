@@ -1,12 +1,13 @@
 // Vercel Serverless Function: /api/fundamentals/[symbol]
-// Handles US (stockanalysis.com), India/UAE (Yahoo Finance quoteSummary)
+// US stocks: stockanalysis.com (financial metrics) + Yahoo Finance earningsTrend (EPS growth)
+// India/UAE: Yahoo Finance quoteSummary (crumb auth)
 
 import https from "node:https";
 import zlib from "node:zlib";
 
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// ── HTTP helper (raw Node https for cookie handling) ─────────────────────────
+// ── HTTP helper ───────────────────────────────────────────────────────────────
 function httpsGet(options) {
   return new Promise((resolve, reject) => {
     const req = https.request({ ...options, maxHeaderSize: 512 * 1024 }, res => {
@@ -32,7 +33,7 @@ function httpsGet(options) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Yahoo Finance Crumb Auth ─────────────────────────────────────────────────
+// ── Yahoo Finance Crumb Auth ──────────────────────────────────────────────────
 async function fetchYahooCrumb() {
   const cookieRes = await httpsGet({
     hostname: "finance.yahoo.com",
@@ -49,7 +50,6 @@ async function fetchYahooCrumb() {
 
   await delay(1500);
 
-  // Try query1 first (different rate limit bucket)
   for (const hostname of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
     const res = await httpsGet({
       hostname,
@@ -82,7 +82,7 @@ async function yahooQuoteSummary(symbol, modules) {
   return row;
 }
 
-// ── stockanalysis.com scraper (US stocks) ────────────────────────────────────
+// ── stockanalysis.com page fetcher ────────────────────────────────────────────
 async function fetchSaPage(slug) {
   try {
     const res = await httpsGet({
@@ -129,94 +129,25 @@ function saField(page, field) {
   return page.data[idx];
 }
 
-// ── Finviz: EPS Growth Rate ─────────────────────────────────────────────────
-async function fetchFinvizEpsGrowth(symbol) {
-  if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
-  try {
-    // Step 1: visit homepage to get cookies (helps bypass Cloudflare)
-    const baseHeaders = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Accept-Encoding": "gzip, br",
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Sec-Fetch-User": "?1",
-      "Cache-Control": "max-age=0",
-    };
-    const homeRes = await httpsGet({
-      hostname: "finviz.com",
-      path: "/",
-      headers: baseHeaders,
-    });
-    const cookie = homeRes.rawCookies.map(c => c.split(";")[0]).join("; ");
-    await delay(800);
-
-    // Step 2: fetch the stock page with the cookie
-    const res = await httpsGet({
-      hostname: "finviz.com",
-      path: `/quote.ashx?t=${encodeURIComponent(symbol.toUpperCase())}&p=d`,
-      headers: {
-        ...baseHeaders,
-        Referer: "https://finviz.com/",
-        "Sec-Fetch-Site": "same-origin",
-        ...(cookie ? { Cookie: cookie } : {}),
-      },
-    });
-    if (res.status !== 200) return null;
-    const html = res.body;
-    // Bail if Cloudflare served a challenge page (no stock data)
-    if (!html.includes("EPS next 5Y") && !html.includes("EPS next Y")) return null;
-
-    // Tight regex: label</td> <td><b>[<span>]VALUE%
-    function finvizPct(label) {
-      const esc = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(esc + "<\/td>\\s*<td[^>]*>\\s*<b>\\s*(?:<span[^>]*>\\s*)?([-\\d.]+)%");
-      const m = html.match(re);
-      return m ? (isFinite(+m[1]) ? +m[1] : null) : null;
-    }
-    // Loose fallback: find label, grab nearest % value within 200 chars
-    function finvizLoose(label) {
-      const idx = html.indexOf(label);
-      if (idx === -1) return null;
-      const m = html.slice(idx, idx + 200).match(/([-\d.]+)%/);
-      return m ? (isFinite(+m[1]) ? +m[1] : null) : null;
-    }
-
-    // Priority 1: Finviz “EPS next 5Y”
-    const next5Y = finvizPct("EPS next 5Y") ?? finvizLoose("EPS next 5Y");
-    if (next5Y !== null) return next5Y;
-
-    // Priority 2: Finviz “EPS next Y” %
-    const nextY = finvizPct("EPS next Y") ?? finvizLoose("EPS next Y");
-    if (nextY !== null) return nextY;
-
-    return null;
-  } catch { return null; }
-}
-
-// ── Yahoo Finance: EPS Growth from earningsTrend (fallback for all stocks) ──
+// ── EPS Growth: Yahoo Finance Analysis page "Growth Estimates → Next Year" ────
+// This matches exactly what you see at finance.yahoo.com/quote/SYMBOL/analysis/
 async function fetchYahooEpsGrowth(symbol) {
   try {
     const result = await yahooQuoteSummary(symbol, ["earningsTrend"]);
     const et = result.earningsTrend;
     if (!et?.trend?.length) return null;
-    // Priority: 5Y estimate → Next Year → Current Year
-    const priority = ["5y", "+1y", "0y"];
-    for (const period of priority) {
-      const entry = et.trend.find(t => t.period === period);
-      if (entry?.growth !== undefined) {
-        const g = raw(entry.growth);
-        if (g !== null && isFinite(g)) return +(g * 100).toFixed(2);
-      }
+    // "+1y" = "Next Year" column from Yahoo Finance Growth Estimates table
+    // Falls back to "0y" (Current Year) if Next Year not available
+    const entry = et.trend.find(t => t.period === "+1y") ?? et.trend.find(t => t.period === "0y");
+    if (entry?.growth !== undefined) {
+      const g = raw(entry.growth);
+      if (g !== null && isFinite(g)) return +(g * 100).toFixed(2);
     }
     return null;
   } catch { return null; }
 }
 
-// ── Yahoo Finance result builder ─────────────────────────────────────────────
+// ── Yahoo Finance result helpers ──────────────────────────────────────────────
 function raw(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return v;
@@ -259,11 +190,12 @@ function buildResultFromYahoo(symbol, result) {
     } else if (ebitda !== null) ebit = ebitda * 0.88;
   }
 
+  // EPS growth: "+1y" from earningsTrend (matches Yahoo Finance Analysis page)
   let epsGrowthRate = null;
   const et = result.earningsTrend;
   if (et?.trend?.length) {
     const entry = et.trend.find(t => t.period === "+1y") ?? et.trend.find(t => t.period === "0y");
-    if (entry?.growth !== undefined) { const g = raw(entry.growth); if (g !== null) epsGrowthRate = g * 100; }
+    if (entry?.growth !== undefined) { const g = raw(entry.growth); if (g !== null) epsGrowthRate = +(g * 100).toFixed(2); }
   }
 
   let netDebtEquity = null;
@@ -281,33 +213,29 @@ function buildResultFromYahoo(symbol, result) {
 
   const operatingProfitToCash = (ebit !== null && operatingCashFlow && operatingCashFlow !== 0)
     ? ebit / operatingCashFlow : null;
-  const epsG = epsGrowthRate;
   const companyName = str(pr.longName) ?? str(pr.shortName) ?? symbol;
   const currency = str(pr.currency) ?? str(fd.financialCurrency) ?? "USD";
-  const peg2 = peg ?? ((pe !== null && epsG && epsG > 0) ? pe / epsG : null);
+  const peg2 = peg ?? ((pe !== null && epsGrowthRate && epsGrowthRate > 0) ? +(pe / epsGrowthRate).toFixed(2) : null);
 
-  return { symbol, companyName, currency, price, eps, pe, epsGrowthRate: epsG, peg: peg2, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
+  return { symbol, companyName, currency, price, eps, pe, epsGrowthRate, peg: peg2, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
 }
 
-// ── fetchViaStockAnalysis (US only) ─────────────────────────────────────────
+// ── fetchViaStockAnalysis (US stocks) ─────────────────────────────────────────
 async function fetchViaStockAnalysis(symbol) {
   if (/\.(NS|BO|DU|AE)$/i.test(symbol)) return null;
   const slug = symbol.toLowerCase();
-  const [overview, income, cashflow, balance, finvizGrowth] = await Promise.all([
+  // Fetch all financial pages in parallel
+  const [overview, income, cashflow, balance] = await Promise.all([
     fetchSaPage(slug),
     fetchSaPage(`${slug}/financials`),
     fetchSaPage(`${slug}/financials/cash-flow-statement`),
     fetchSaPage(`${slug}/financials/balance-sheet`),
-    fetchFinvizEpsGrowth(symbol),
   ]);
   if (!overview) return null;
 
   const eps = saNum(overview, "eps");
   const peStrRaw = saField(overview, "peRatio");
   const pe = typeof peStrRaw === "string" ? (parseFloat(peStrRaw) || null) : (typeof peStrRaw === "number" ? peStrRaw : null);
-  let epsGrowthRate = finvizGrowth;
-
-  const peg = (pe !== null && epsGrowthRate !== null && epsGrowthRate > 0) ? pe / epsGrowthRate : null;
 
   let price = null;
   const targetStr = saField(overview, "target");
@@ -340,7 +268,6 @@ async function fetchViaStockAnalysis(symbol) {
   const operatingProfitToCash = (ebit !== null && operatingCashFlow && operatingCashFlow !== 0)
     ? ebit / operatingCashFlow : null;
 
-  // Company name from description
   let companyName = symbol;
   const desc = saField(overview, "description");
   if (typeof desc === "string" && desc.length > 10) {
@@ -349,17 +276,18 @@ async function fetchViaStockAnalysis(symbol) {
     else { const clause = desc.split(/[,.]/)[0]; if (clause && clause.length < 80) companyName = clause.trim(); }
   }
 
-  return { symbol, companyName, currency: "USD", price, eps, pe, epsGrowthRate, peg, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
+  // EPS growth and PEG set to null here — filled in by orchestrator via Yahoo
+  return { symbol, companyName, currency: "USD", price, eps, pe, epsGrowthRate: null, peg: null, operatingCashFlow, netDebtEquity, operatingProfitToCash, ebit, ebitda };
 }
 
-// ── fetchViaCrumb (India/UAE) ────────────────────────────────────────────────
+// ── fetchViaCrumb (India/UAE) ─────────────────────────────────────────────────
 async function fetchViaCrumb(symbol) {
   const modules = ["defaultKeyStatistics", "financialData", "summaryDetail", "price", "earningsTrend"];
   const result = await yahooQuoteSummary(symbol, modules);
   return buildResultFromYahoo(symbol, result);
 }
 
-// ── Live price via Spark ─────────────────────────────────────────────────────
+// ── Live price via Spark ──────────────────────────────────────────────────────
 async function fetchLivePrice(symbol) {
   try {
     const res = await httpsGet({
@@ -377,29 +305,29 @@ async function fetchLivePrice(symbol) {
   } catch { return null; }
 }
 
-// ── Main orchestrator ────────────────────────────────────────────────────────
+// ── Main orchestrator ─────────────────────────────────────────────────────────
 async function fetchFundamentals(symbol) {
   const isInternational = /\.(NS|BO|DU|AE)$/i.test(symbol);
+
   if (!isInternational) {
-    const saResult = await fetchViaStockAnalysis(symbol);
+    // US stocks: SA for financials + Yahoo earningsTrend for EPS growth (run in parallel)
+    const [saResult, yahooGrowth] = await Promise.all([
+      fetchViaStockAnalysis(symbol),
+      fetchYahooEpsGrowth(symbol),
+    ]);
+
     if (saResult) {
-      // EPS Growth fallback chain: Finviz 5Y → Finviz Next Y → Yahoo earningsTrend
-      if (saResult.epsGrowthRate === null) {
-        console.log(`[${symbol}] Finviz blocked or returned null — trying Yahoo earningsTrend`);
-        const yahooGrowth = await fetchYahooEpsGrowth(symbol);
-        if (yahooGrowth !== null) {
-          saResult.epsGrowthRate = yahooGrowth;
-          // Recalculate PEG with the newly found growth rate
-          if (saResult.pe !== null && yahooGrowth > 0) {
-            saResult.peg = +(saResult.pe / yahooGrowth).toFixed(2);
-          }
-        }
+      // Fill in EPS growth and recalculate PEG
+      saResult.epsGrowthRate = yahooGrowth;
+      if (saResult.pe !== null && yahooGrowth !== null && yahooGrowth > 0) {
+        saResult.peg = +(saResult.pe / yahooGrowth).toFixed(2);
       }
       return saResult;
     }
-    // Full Yahoo fallback for unknown US tickers
+    // Full Yahoo fallback if SA fails
     try { return await fetchViaCrumb(symbol); } catch { return null; }
   }
+
   // International: Yahoo quoteSummary + live price
   const [crumbResult, livePrice] = await Promise.allSettled([
     fetchViaCrumb(symbol),
@@ -416,7 +344,7 @@ async function fetchFundamentals(symbol) {
   return data;
 }
 
-// ── Handler ──────────────────────────────────────────────────────────────────
+// ── Handler ───────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(200).end();
